@@ -7,6 +7,8 @@ import os
 import tempfile
 import threading
 import time
+import ctypes
+from ctypes import wintypes
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -88,8 +90,8 @@ F13_MAP = {
     SC_0: (SC_F10, False),
     SC_MINUS: (SC_F11, False),
     SC_EQUAL: (SC_F12, False),
-    SC_F: (26, False),   # mirrors keyhac "26"
-    SC_J: (22, False),   # mirrors keyhac "22"
+    SC_F: (0x7B, False),
+    SC_J: (0x79, False),
     SC_K: (SC_HOME, True),
     SC_COMMA: (SC_END, True),
     SC_L: (SC_PGUP, True),
@@ -195,6 +197,94 @@ def send_alt_shift_enter_combo(ctx, device, *, lctrl_down: bool, lshift_down: bo
     lib.interception_send(ctx, device, ffi.new("InterceptionKeyStroke[]", strokes), len(strokes))
 
 
+# WinAPI for SendInput
+INPUT_KEYBOARD = 1
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_EXTENDEDKEY = 0x0001
+KEYEVENTF_SCANCODE = 0x0008
+
+VK_IME_ON = 0x16
+VK_IME_OFF = 0x1A
+VK_CONVERT = 0x1C
+VK_NONCONVERT = 0x1D
+
+ULONG_PTR = wintypes.WPARAM
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR)
+    ]
+
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    ]
+
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    ]
+
+class INPUT(ctypes.Structure):
+    class _INPUT(ctypes.Union):
+        _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT), ("hi", HARDWAREINPUT)]
+    _anonymous_ = ("_input",)
+    _fields_ = [
+        ("type", wintypes.DWORD),
+        ("_input", _INPUT)
+    ]
+
+def send_vk(vk_code: int, is_up: bool) -> None:
+    inputs = INPUT()
+    inputs.type = INPUT_KEYBOARD
+    inputs.ki.wVk = vk_code
+    inputs.ki.dwFlags = KEYEVENTF_KEYUP if is_up else 0
+    
+    # PowerToys logic: Set extended key flag if needed
+    # See Helpers::IsExtendedKey in PowerToys
+    # VK_CONVERT/VK_NONCONVERT are NOT extended keys usually, but let's be precise if we add others.
+    # For now, we just follow the basic structure.
+    
+    # PowerToys logic: Set wScan using MapVirtualKey
+    # MapVirtualKey returns 0 if the key code does not correspond to a physical key.
+    # For VK_CONVERT/VK_NONCONVERT on US keyboard, it might return 0.
+    # If it returns 0, we might want to force the scancode if we know it.
+    scancode = ctypes.windll.user32.MapVirtualKeyW(vk_code, 0)
+    if scancode == 0:
+        if vk_code == VK_CONVERT:
+            scancode = 0x79
+        elif vk_code == VK_NONCONVERT:
+            scancode = 0x7B
+
+    inputs.ki.wScan = scancode
+    
+    # PowerToys logic: Set dwExtraInfo to KEYBOARDMANAGER_SINGLEKEY_FLAG (0x11)
+    # This marks the event as injected by Keyboard Manager (or our script mimicking it)
+    # PowerToys has two relevant concepts:
+    # - CommonSharedConstants::KEYBOARDMANAGER_INJECTED_FLAG (0x1)
+    # - KeyboardManagerConstants::KEYBOARDMANAGER_SINGLEKEY_FLAG (0x11)
+    # Their SINGLEKEY_FLAG already includes the injected bit.
+    inputs.ki.dwExtraInfo = 0x11
+
+    sent = ctypes.windll.user32.SendInput(1, ctypes.byref(inputs), ctypes.sizeof(INPUT))
+    if sent != 1 and DEBUG_KEYS:
+        err = ctypes.windll.kernel32.GetLastError()
+        _dbg(f"SendInput failed: sent={sent} vk=0x{vk_code:02X} up={is_up} cbSize={ctypes.sizeof(INPUT)} err={err}")
+
+
 def process_keystroke(ctx, device, stroke, mod: ModifierState) -> None:
     code = stroke[0].code
     state = stroke[0].state
@@ -230,6 +320,20 @@ def process_keystroke(ctx, device, stroke, mod: ModifierState) -> None:
 
     # F13 combos
     if mod.f13_down and code in F13_MAP:
+        # Direct IME switching
+        if code == SC_F:
+            # Match PowerToys target key: "IME Off" (VK_IME_OFF)
+            send_vk(VK_IME_OFF, is_up)
+            if DEBUG_KEYS:
+                _dbg(f"t={time.monotonic():.6f} dev={device} f13combo src=0x{code:02X} -> VK_IME_OFF up={is_up}")
+            return
+        if code == SC_J:
+            # Match PowerToys target key: "IME On" (VK_IME_ON)
+            send_vk(VK_IME_ON, is_up)
+            if DEBUG_KEYS:
+                _dbg(f"t={time.monotonic():.6f} dev={device} f13combo src=0x{code:02X} -> VK_IME_ON up={is_up}")
+            return
+
         target_code, use_e0 = F13_MAP[code]
         remapped = make_keystroke(target_code, base_state, extended=use_e0)
         lib.interception_send(ctx, device, ffi.new("InterceptionKeyStroke[]", [remapped]), 1)
