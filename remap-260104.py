@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import argparse
+import atexit
+import msvcrt
 import os
+import tempfile
+import threading
 import time
 from dataclasses import dataclass
+from typing import Callable, Optional
 
+from PIL import Image, ImageDraw
+import pystray
 from interception import ffi, lib
 
 # Set 1 scancodes
@@ -60,6 +68,8 @@ SC_PGUP = 0x49
 SC_PGDN = 0x51
 
 DEBUG_KEYS = os.environ.get("DEBUG_KEYS", "1") != "0"
+REFRESH_INTERVAL_SEC = 0.5
+LOCK_PATH = os.path.join(tempfile.gettempdir(), "my-interception.lock")
 
 F13_MAP = {
     SC_OPEN_BRACKET: (SC_UP, True),
@@ -252,8 +262,15 @@ def process_keystroke(ctx, device, stroke, mod: ModifierState) -> None:
     passthrough(ctx, device, stroke)
 
 
-def main() -> None:
+def run_loop(
+    stop_event: Optional[threading.Event] = None,
+    reload_event: Optional[threading.Event] = None,
+    ctx_holder: Optional[dict] = None,
+    is_enabled: Optional[Callable[[], bool]] = None,
+) -> None:
     ctx = create_context()
+    if ctx_holder is not None:
+        ctx_holder["ctx"] = ctx
     print("F13-mode remap active on keyboard device 1 (Ctrl+C to stop)")
     if DEBUG_KEYS:
         print("DEBUG_KEYS=1: logging CapsLock/Ctrl/F13/A events", flush=True)
@@ -267,10 +284,18 @@ def main() -> None:
             read = lib.interception_receive(ctx, device, ffi.cast("InterceptionStroke*", stroke), 1)
             if read <= 0:
                 continue
+            if stop_event and stop_event.is_set():
+                break
+            if reload_event and reload_event.is_set():
+                reload_event.clear()
+                break
             if not lib.interception_is_keyboard(device):
                 passthrough(ctx, device, stroke)
                 continue
             if device != 1:
+                passthrough(ctx, device, stroke)
+                continue
+            if is_enabled is not None and not is_enabled():
                 passthrough(ctx, device, stroke)
                 continue
 
@@ -278,7 +303,213 @@ def main() -> None:
     except KeyboardInterrupt:
         print("Stopping...")
     finally:
-        lib.interception_destroy_context(ctx)
+        if ctx_holder is not None:
+            ctx_holder.pop("ctx", None)
+        try:
+            lib.interception_destroy_context(ctx)
+        except Exception:
+            pass
+
+
+class RemapService:
+    def __init__(self) -> None:
+        self._stop_event = threading.Event()
+        self._reload_event = threading.Event()
+        self._state_lock = threading.Lock()
+        self._state = "starting"
+        self._thread: Optional[threading.Thread] = None
+        self._ctx_holder: dict = {}
+        self._enabled_lock = threading.Lock()
+        self._enabled = True
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._reload_event.clear()
+        self._thread = threading.Thread(target=self._run, name="remap-loop", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            self._set_state("running")
+            run_loop(
+                self._stop_event,
+                self._reload_event,
+                self._ctx_holder,
+                self.is_enabled,
+            )
+            if self._stop_event.is_set():
+                break
+            if self._reload_event.is_set():
+                self._reload_event.clear()
+                self._set_state("reloading")
+                continue
+            break
+        self._set_state("stopped")
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._destroy_ctx()
+        if self._thread:
+            self._thread.join(timeout=3)
+
+    def request_reload(self) -> None:
+        self._reload_event.set()
+        self._destroy_ctx()
+
+    def status(self) -> str:
+        with self._state_lock:
+            return self._state
+
+    def status_label(self) -> str:
+        enabled = self.is_enabled()
+        state = self.status()
+        if state == "running" and not enabled:
+            return "running (disabled)"
+        return state
+
+    def is_enabled(self) -> bool:
+        with self._enabled_lock:
+            return self._enabled
+
+    def enable(self) -> None:
+        with self._enabled_lock:
+            self._enabled = True
+
+    def disable(self) -> None:
+        with self._enabled_lock:
+            self._enabled = False
+
+    def toggle_enabled(self) -> None:
+        with self._enabled_lock:
+            self._enabled = not self._enabled
+
+    def _set_state(self, state: str) -> None:
+        with self._state_lock:
+            self._state = state
+
+    def _destroy_ctx(self) -> None:
+        ctx = self._ctx_holder.get("ctx")
+        if ctx is None:
+            return
+        try:
+            lib.interception_destroy_context(ctx)
+        except Exception:
+            pass
+
+
+def _make_icon(color: str) -> Image.Image:
+    size = 64
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    draw.ellipse((8, 8, size - 8, size - 8), fill=color, outline="#111111")
+    return img
+
+
+_LOCK_FILE_HANDLE: Optional[object] = None
+
+
+def acquire_single_instance_lock() -> bool:
+    """Try to obtain a non-blocking file lock; return False if another instance holds it."""
+    global _LOCK_FILE_HANDLE
+    if _LOCK_FILE_HANDLE is not None:
+        return True
+
+    try:
+        fh = open(LOCK_PATH, "a+b")
+        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        _LOCK_FILE_HANDLE = fh
+        atexit.register(release_single_instance_lock)
+        return True
+    except OSError:
+        return False
+
+
+def release_single_instance_lock() -> None:
+    global _LOCK_FILE_HANDLE
+    fh = _LOCK_FILE_HANDLE
+    if fh is None:
+        return
+    try:
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+    except Exception:
+        pass
+    try:
+        fh.close()
+    except Exception:
+        pass
+    _LOCK_FILE_HANDLE = None
+
+
+class TrayApp:
+    def __init__(self, service: RemapService) -> None:
+        self.service = service
+        self._icons = {
+            "running": _make_icon("#4CAF50"),
+            "disabled": _make_icon("#9E9E9E"),
+            "reloading": _make_icon("#FFC107"),
+            "stopped": _make_icon("#F44336"),
+            "starting": _make_icon("#2196F3"),
+        }
+        self.icon = pystray.Icon(
+            "my-interception",
+            self._icons["starting"],
+            "Remap: starting",
+            menu=pystray.Menu(
+                pystray.MenuItem(lambda _item: f"Status: {self.service.status_label()}", None, enabled=False),
+                pystray.MenuItem(lambda _item: ("Disable mapping" if self.service.is_enabled() else "Enable mapping"), self._toggle_enabled),
+                pystray.MenuItem("Reload mapping", self._reload),
+                pystray.MenuItem("Quit", self._quit),
+            ),
+        )
+
+    def run(self) -> None:
+        self.service.start()
+        threading.Thread(target=self._refresh_ui, name="tray-refresh", daemon=True).start()
+        self.icon.run()
+
+    def _reload(self, _icon: pystray.Icon, _item) -> None:
+        self.service.request_reload()
+
+    def _quit(self, _icon: pystray.Icon, _item) -> None:
+        self.service.stop()
+        self.icon.visible = False
+        self.icon.stop()
+
+    def _toggle_enabled(self, _icon: pystray.Icon, _item) -> None:
+        self.service.toggle_enabled()
+
+    def _refresh_ui(self) -> None:
+        last_state_key = None
+        while True:
+            state = self.service.status()
+            enabled = self.service.is_enabled()
+            state_key = "disabled" if state == "running" and not enabled else state
+            if state_key != last_state_key:
+                self.icon.title = f"Remap: {self.service.status_label()}"
+                self.icon.icon = self._icons.get(state_key, self._icons["starting"])
+                last_state_key = state_key
+            if state == "stopped":
+                break
+            time.sleep(REFRESH_INTERVAL_SEC)
+
+
+def main() -> None:
+    if not acquire_single_instance_lock():
+        return
+
+    parser = argparse.ArgumentParser(description="F13-mode remapper with tray support")
+    parser.add_argument("--no-tray", action="store_true", help="Run without system tray")
+    args = parser.parse_args()
+
+    if args.no_tray:
+        run_loop()
+        return
+
+    service = RemapService()
+    TrayApp(service).run()
 
 
 if __name__ == "__main__":
