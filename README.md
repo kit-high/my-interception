@@ -7,6 +7,7 @@ Small helper to remap CapsLock/LCTRL/F13 combos via the Interception driver, wit
 ## 機能
 - CapsLock を LCTRL に変換し、LCTRL/F13 を修飾キーとして利用
 - F13+各キーで矢印・ファンクションキー等へリマップ
+- F13+F / F13+J で IME を OFF/ON（PowerToys 側の追加リマップ不要）
 - Alt+Shift 組み合わせでワード移動などのショートカット送出
 - タスクトレイから Enable/Disable・Reload・Quit を操作
 - 多重起動防止（TEMP のロックファイルを使用）
@@ -37,6 +38,8 @@ Small helper to remap CapsLock/LCTRL/F13 combos via the Interception driver, wit
 ## 既知の注意点
 - デバイス ID 1 のキーボードのみを対象としています。複数キーボードを扱う場合はコードのフィルタを調整してください。
 - Interception 待ち受けが止まらない場合に備え、Quit/Reload 時はコンテキストを強制解放しています。
+- IME の切り替えは Windows API の `SendInput` で `VK_IME_ON` / `VK_IME_OFF` を注入しています。
+	- 64bit Windows では `INPUT` 構造体サイズが重要です（ctypes 側で `MOUSEINPUT`/`HARDWAREINPUT` を含む union を定義しないと `SendInput` が失敗し、ログは出ても IME が切り替わりません）。
 
 ## 開発メモ
 - 依存: `requirements.txt` (interception, pystray, Pillow など)
