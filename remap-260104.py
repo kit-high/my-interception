@@ -384,7 +384,9 @@ def run_loop(
 
     try:
         while True:
-            device = lib.interception_wait(ctx)
+            device = lib.interception_wait_with_timeout(ctx, 500)
+            if device == 0:  # timeout (INTERCEPTION_INVALID) — no event, loop again
+                continue
             read = lib.interception_receive(ctx, device, ffi.cast("InterceptionStroke*", stroke), 1)
             if read <= 0:
                 continue
@@ -415,6 +417,120 @@ def run_loop(
             pass
 
 
+# ---------------------------------------------------------------------------
+# Device change monitoring — auto-reload Interception context on USB reconnect
+# ---------------------------------------------------------------------------
+_WM_DEVICECHANGE = 0x0219
+_DBT_DEVICEARRIVAL = 0x8000
+_DBT_DEVTYP_DEVICEINTERFACE = 0x00000005
+_DEVICE_NOTIFY_ALL_INTERFACE_CLASSES = 0x00000004
+
+_WNDPROC_T = ctypes.WINFUNCTYPE(
+    ctypes.c_long, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
+)
+
+
+class _WNDCLASSEXW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_uint),
+        ("style", ctypes.c_uint),
+        ("lpfnWndProc", _WNDPROC_T),
+        ("cbClsExtra", ctypes.c_int),
+        ("cbWndExtra", ctypes.c_int),
+        ("hInstance", wintypes.HINSTANCE),
+        ("hIcon", wintypes.HICON),
+        ("hCursor", wintypes.HANDLE),
+        ("hbrBackground", wintypes.HBRUSH),
+        ("lpszMenuName", wintypes.LPCWSTR),
+        ("lpszClassName", wintypes.LPCWSTR),
+        ("hIconSm", wintypes.HICON),
+    ]
+
+
+class _DEV_BROADCAST_DEVICEINTERFACE_W(ctypes.Structure):
+    _fields_ = [
+        ("dbcc_size", ctypes.c_uint32),
+        ("dbcc_devicetype", ctypes.c_uint32),
+        ("dbcc_reserved", ctypes.c_uint32),
+        ("dbcc_classguid", ctypes.c_byte * 16),
+        ("dbcc_name", ctypes.c_wchar * 1),
+    ]
+
+
+def _start_device_monitor(on_device_arrived: Callable[[], None]) -> None:
+    """Daemon thread: watches for any USB device arrival and calls on_device_arrived (debounced).
+
+    When an external keyboard is reconnected, the Interception driver context can become
+    stale. Detecting device arrival and recreating the context (via on_device_arrived →
+    RemapService.request_reload) fixes the unresponsive-keyboard problem without needing
+    to reinstall the driver or reboot.
+    """
+    _RELOAD_DELAY_SEC = 1.5  # wait for Windows to finish setting up the new device
+    _pending_timer: list[Optional[threading.Timer]] = [None]
+
+    def _schedule_reload() -> None:
+        if _pending_timer[0] is not None:
+            _pending_timer[0].cancel()
+        t = threading.Timer(_RELOAD_DELAY_SEC, on_device_arrived)
+        t.daemon = True
+        t.start()
+        _pending_timer[0] = t
+
+    def _run() -> None:
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+
+        class_name = "MyInterceptionDevMon"
+        hinstance = kernel32.GetModuleHandleW(None)
+
+        def _wndproc(hwnd: int, msg: int, wparam: int, lparam: int) -> int:
+            if msg == _WM_DEVICECHANGE and wparam == _DBT_DEVICEARRIVAL:
+                _dbg("DeviceMonitor: device arrival detected — scheduling context reload")
+                _schedule_reload()
+            return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+        wndproc_cb = _WNDPROC_T(_wndproc)  # must stay alive for the lifetime of the window
+
+        wc = _WNDCLASSEXW()
+        wc.cbSize = ctypes.sizeof(_WNDCLASSEXW)
+        wc.lpfnWndProc = wndproc_cb
+        wc.hInstance = hinstance
+        wc.lpszClassName = class_name
+        if not user32.RegisterClassExW(ctypes.byref(wc)):
+            err = kernel32.GetLastError()
+            if err != 1410:  # 1410 = ERROR_CLASS_ALREADY_EXISTS (harmless)
+                _dbg(f"DeviceMonitor: RegisterClassExW failed err={err}")
+                return
+
+        hwnd = user32.CreateWindowExW(
+            0, class_name, None, 0,
+            0, 0, 0, 0,
+            -3,   # HWND_MESSAGE — message-only window, no visible UI
+            None, hinstance, None,
+        )
+        if not hwnd:
+            _dbg(f"DeviceMonitor: CreateWindowExW failed err={kernel32.GetLastError()}")
+            return
+
+        notif_filter = _DEV_BROADCAST_DEVICEINTERFACE_W()
+        notif_filter.dbcc_size = ctypes.sizeof(_DEV_BROADCAST_DEVICEINTERFACE_W)
+        notif_filter.dbcc_devicetype = _DBT_DEVTYP_DEVICEINTERFACE
+        # DEVICE_NOTIFY_ALL_INTERFACE_CLASSES: catch all device classes (GUID ignored)
+        user32.RegisterDeviceNotificationW(
+            hwnd,
+            ctypes.byref(notif_filter),
+            _DEVICE_NOTIFY_ALL_INTERFACE_CLASSES,
+        )
+
+        _dbg("DeviceMonitor: listening for device arrivals")
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+
+    threading.Thread(target=_run, name="dev-monitor", daemon=True).start()
+
+
 class RemapService:
     def __init__(self) -> None:
         self._stop_event = threading.Event()
@@ -425,10 +541,14 @@ class RemapService:
         self._ctx_holder: dict = {}
         self._enabled_lock = threading.Lock()
         self._enabled = True
+        self._device_monitor_started = False
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
+        if not self._device_monitor_started:
+            self._device_monitor_started = True
+            _start_device_monitor(self.request_reload)
         self._stop_event.clear()
         self._reload_event.clear()
         self._thread = threading.Thread(target=self._run, name="remap-loop", daemon=True)
