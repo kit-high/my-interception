@@ -74,6 +74,9 @@ DEBUG_KEYS = os.environ.get("DEBUG_KEYS", "1") != "0"
 REFRESH_INTERVAL_SEC = 0.5
 LOCK_PATH = os.path.join(tempfile.gettempdir(), "my-interception.lock")
 
+MODE_BODY = "body"
+MODE_EXTERNAL = "external"
+
 F13_MAP = {
     SC_OPEN_BRACKET: (SC_UP, True),
     SC_SLASH: (SC_DOWN, True),
@@ -333,11 +336,14 @@ class ModifierState:
 class KeyboardHook:
     """Installs a WH_KEYBOARD_LL hook and remaps keys in the callback."""
 
-    def __init__(self, is_enabled: Optional[Callable[[], bool]] = None) -> None:
+    def __init__(self,
+                 is_enabled: Optional[Callable[[], bool]] = None,
+                 get_mode: Optional[Callable[[], str]] = None) -> None:
         self._hook: Optional[int] = None
         self._thread_id: Optional[int] = None
         self._mod = ModifierState()
         self._is_enabled = is_enabled
+        self._get_mode = get_mode
         # Must prevent GC of the callback
         self._proc = HOOKPROC(self._ll_keyboard_proc)
 
@@ -378,6 +384,9 @@ class KeyboardHook:
         if self._thread_id:
             user32.PostThreadMessageW(self._thread_id, 0x0012, 0, 0)  # WM_QUIT
 
+    def reset_modifier_state(self) -> None:
+        self._mod = ModifierState()
+
     # ------------------------------------------------------------------
 
     def _ll_keyboard_proc(self, nCode: int, wParam: int, lParam: int) -> int:
@@ -406,13 +415,27 @@ class KeyboardHook:
         """Process a single keystroke. Return 1 to suppress, None to pass through."""
         mod = self._mod
         original = scancode
+        mode = self._get_mode() if self._get_mode is not None else MODE_BODY
 
         if DEBUG_KEYS and original in (SC_CAPSLOCK, SC_LCTRL, SC_F13, SC_A):
             _dbg(
                 f"t={time.monotonic():.6f} recv sc=0x{original:02X} "
                 f"up={is_up} ext={is_extended} "
-                f"f13_down={mod.f13_down} ctrl_down={mod.ctrl_down}"
+                f"f13_down={mod.f13_down} ctrl_down={mod.ctrl_down} mode={mode}"
             )
+
+        if mode == MODE_EXTERNAL:
+            if original == SC_F13:
+                send_scancode(SC_LCTRL, up=is_up, extended=False)
+                if DEBUG_KEYS:
+                    _dbg(f"t={time.monotonic():.6f} external map F13->LCTRL up={is_up}")
+                return 1
+            if original == SC_LCTRL:
+                send_scancode(SC_F13, up=is_up, extended=False)
+                if DEBUG_KEYS:
+                    _dbg(f"t={time.monotonic():.6f} external map LCTRL->F13 up={is_up}")
+                return 1
+            return None
 
         # CapsLock -> LCTRL
         if original == SC_CAPSLOCK:
@@ -420,13 +443,6 @@ class KeyboardHook:
             if DEBUG_KEYS:
                 _dbg(f"t={time.monotonic():.6f} map CapsLock->LCTRL up={is_up}")
             return 1  # suppress original
-
-        # Physical LCTRL acts as F13 modifier (consume — no output)
-        if original == SC_LCTRL and not is_extended:
-            mod.f13_down = not is_up
-            if DEBUG_KEYS:
-                _dbg(f"t={time.monotonic():.6f} set f13_down={mod.f13_down} (from physical LCTRL)")
-            return 1
 
         # Physical F13 acts as modifier (consume)
         if original == SC_F13:
@@ -495,6 +511,8 @@ class RemapService:
         self._thread: Optional[threading.Thread] = None
         self._enabled_lock = threading.Lock()
         self._enabled = True
+        self._mode_lock = threading.Lock()
+        self._mode = MODE_BODY
         self._hook: Optional[KeyboardHook] = None
 
     def start(self) -> None:
@@ -506,11 +524,11 @@ class RemapService:
 
     def _run(self) -> None:
         self._set_state("running")
-        hook = KeyboardHook(is_enabled=self.is_enabled)
+        hook = KeyboardHook(is_enabled=self.is_enabled, get_mode=self.mode)
         self._hook = hook
         try:
             hook.install()
-            print("F13-mode remap active (WH_KEYBOARD_LL hook, Ctrl+C to stop)")
+            print(f"F13-mode remap active ({self.mode_label()} mode, WH_KEYBOARD_LL hook, Ctrl+C to stop)")
             if DEBUG_KEYS:
                 print("DEBUG_KEYS=1: logging CapsLock/Ctrl/F13/A events", flush=True)
 
@@ -551,8 +569,8 @@ class RemapService:
         enabled = self.is_enabled()
         state = self.status()
         if state == "running" and not enabled:
-            return "running (disabled)"
-        return state
+            return f"running (disabled) / {self.mode_label()}"
+        return f"{state} / {self.mode_label()}"
 
     def is_enabled(self) -> bool:
         with self._enabled_lock:
@@ -569,6 +587,22 @@ class RemapService:
     def toggle_enabled(self) -> None:
         with self._enabled_lock:
             self._enabled = not self._enabled
+
+    def mode(self) -> str:
+        with self._mode_lock:
+            return self._mode
+
+    def mode_label(self) -> str:
+        return self.mode()
+
+    def set_mode(self, mode: str) -> None:
+        if mode not in (MODE_BODY, MODE_EXTERNAL):
+            raise ValueError(f"Unknown mode: {mode}")
+        with self._mode_lock:
+            changed = self._mode != mode
+            self._mode = mode
+        if changed and self._hook:
+            self._hook.reset_modifier_state()
 
     def _set_state(self, state: str) -> None:
         with self._state_lock:
@@ -647,6 +681,13 @@ class TrayApp:
             "Remap: starting",
             menu=pystray.Menu(
                 pystray.MenuItem(lambda _item: f"Status: {self.service.status_label()}", None, enabled=False),
+                pystray.MenuItem(lambda _item: f"Mode: {self.service.mode_label()}", None, enabled=False),
+                pystray.MenuItem("💻Body mode", self._set_body_mode,
+                                 checked=lambda _item: self.service.mode() == MODE_BODY,
+                                 radio=True),
+                pystray.MenuItem("⌨External mode", self._set_external_mode,
+                                 checked=lambda _item: self.service.mode() == MODE_EXTERNAL,
+                                 radio=True),
                 pystray.MenuItem(lambda _item: ("Disable mapping" if self.service.is_enabled() else "Enable mapping"), self._toggle_enabled),
                 pystray.MenuItem("Reload mapping", self._reload),
                 pystray.MenuItem("Quit", self._quit),
@@ -658,25 +699,35 @@ class TrayApp:
         threading.Thread(target=self._refresh_ui, name="tray-refresh", daemon=True).start()
         self.icon.run()
 
-    def _reload(self, _icon: pystray.Icon, _item) -> None:
+    def _reload(self, _icon, _item) -> None:
         self.service.request_reload()
 
-    def _quit(self, _icon: pystray.Icon, _item) -> None:
+    def _quit(self, _icon, _item) -> None:
         self.service.stop()
         self.icon.visible = False
         self.icon.stop()
 
-    def _toggle_enabled(self, _icon: pystray.Icon, _item) -> None:
+    def _toggle_enabled(self, _icon, _item) -> None:
         self.service.toggle_enabled()
+
+    def _set_body_mode(self, _icon, _item) -> None:
+        self.service.set_mode(MODE_BODY)
+
+    def _set_external_mode(self, _icon, _item) -> None:
+        self.service.set_mode(MODE_EXTERNAL)
 
     def _refresh_ui(self) -> None:
         last_state_key = None
+        last_status_label = None
         while True:
             state = self.service.status()
             enabled = self.service.is_enabled()
             state_key = "disabled" if state == "running" and not enabled else state
+            status_label = self.service.status_label()
+            if status_label != last_status_label:
+                self.icon.title = f"Remap: {status_label}"
+                last_status_label = status_label
             if state_key != last_state_key:
-                self.icon.title = f"Remap: {self.service.status_label()}"
                 self.icon.icon = self._icons.get(state_key, self._icons["starting"])
                 last_state_key = state_key
             if state == "stopped":
