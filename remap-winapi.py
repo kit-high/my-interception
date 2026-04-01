@@ -11,8 +11,7 @@ import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
 from typing import Callable, Optional
-
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 import pystray
 
 # ---------------------------------------------------------------------------
@@ -604,6 +603,10 @@ class RemapService:
         if changed and self._hook:
             self._hook.reset_modifier_state()
 
+    def toggle_mode(self) -> None:
+        next_mode = MODE_EXTERNAL if self.mode() == MODE_BODY else MODE_BODY
+        self.set_mode(next_mode)
+
     def _set_state(self, state: str) -> None:
         with self._state_lock:
             self._state = state
@@ -613,11 +616,32 @@ class RemapService:
 # Tray UI
 # ---------------------------------------------------------------------------
 
-def _make_icon(color: str) -> Image.Image:
+def _load_icon_font(size: int) -> ImageFont.ImageFont:
+    font_candidates = [
+        os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "segoeuib.ttf"),
+        os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "arialbd.ttf"),
+    ]
+    for path in font_candidates:
+        try:
+            return ImageFont.truetype(path, size=size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def _make_icon(color: str, label: str = "") -> Image.Image:
     size = 64
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     draw.ellipse((8, 8, size - 8, size - 8), fill=color, outline="#111111")
+    if label:
+        font = _load_icon_font(28)
+        text_box = draw.textbbox((0, 0), label, font=font)
+        text_width = text_box[2] - text_box[0]
+        text_height = text_box[3] - text_box[1]
+        text_x = (size - text_width) / 2 - text_box[0]
+        text_y = (size - text_height) / 2 - text_box[1] - 1
+        draw.text((text_x, text_y), label, fill="#FFFFFF", font=font)
     return img
 
 
@@ -662,24 +686,25 @@ def release_single_instance_lock() -> None:
 
 
 # ---------------------------------------------------------------------------
-# TrayApp
-# ---------------------------------------------------------------------------
 
 class TrayApp:
     def __init__(self, service: RemapService) -> None:
         self.service = service
         self._icons = {
-            "running": _make_icon("#4CAF50"),
-            "disabled": _make_icon("#9E9E9E"),
-            "reloading": _make_icon("#FFC107"),
-            "stopped": _make_icon("#F44336"),
-            "starting": _make_icon("#2196F3"),
+            "body": _make_icon("#1565C0", "B"),
+            "external": _make_icon("#EF6C00", "E"),
+            "body-disabled": _make_icon("#78909C", "B"),
+            "external-disabled": _make_icon("#8D6E63", "E"),
+            "reloading": _make_icon("#FFC107", "R"),
+            "stopped": _make_icon("#C62828", "X"),
+            "starting": _make_icon("#546E7A", "..."),
         }
         self.icon = pystray.Icon(
             "my-interception",
             self._icons["starting"],
             "Remap: starting",
             menu=pystray.Menu(
+                pystray.MenuItem(lambda _item: self._toggle_mode_label(), self._toggle_mode, default=True),
                 pystray.MenuItem(lambda _item: f"Status: {self.service.status_label()}", None, enabled=False),
                 pystray.MenuItem(lambda _item: f"Mode: {self.service.mode_label()}", None, enabled=False),
                 pystray.MenuItem("💻Body mode", self._set_body_mode,
@@ -709,27 +734,45 @@ class TrayApp:
 
     def _toggle_enabled(self, _icon, _item) -> None:
         self.service.toggle_enabled()
+        self._update_ui_once()
+
+    def _toggle_mode(self, _icon, _item) -> None:
+        self.service.toggle_mode()
+        self._update_ui_once()
+
+    def _toggle_mode_label(self) -> str:
+        next_mode = MODE_EXTERNAL if self.service.mode() == MODE_BODY else MODE_BODY
+        return f"Switch to {next_mode} mode"
 
     def _set_body_mode(self, _icon, _item) -> None:
         self.service.set_mode(MODE_BODY)
+        self._update_ui_once()
 
     def _set_external_mode(self, _icon, _item) -> None:
         self.service.set_mode(MODE_EXTERNAL)
+        self._update_ui_once()
+
+    def _icon_key(self) -> str:
+        state = self.service.status()
+        if state != "running":
+            return state
+        mode = self.service.mode()
+        if self.service.is_enabled():
+            return mode
+        return f"{mode}-disabled"
+
+    def _update_ui_once(self) -> tuple[str, str, str]:
+        state = self.service.status()
+        state_key = self._icon_key()
+        status_label = self.service.status_label()
+        self.icon.title = f"Remap: {status_label}"
+        self.icon.icon = self._icons.get(state_key, self._icons["starting"])
+        self.icon.update_menu()
+        return state, state_key, status_label
 
     def _refresh_ui(self) -> None:
-        last_state_key = None
-        last_status_label = None
         while True:
-            state = self.service.status()
-            enabled = self.service.is_enabled()
-            state_key = "disabled" if state == "running" and not enabled else state
-            status_label = self.service.status_label()
-            if status_label != last_status_label:
-                self.icon.title = f"Remap: {status_label}"
-                last_status_label = status_label
-            if state_key != last_state_key:
-                self.icon.icon = self._icons.get(state_key, self._icons["starting"])
-                last_state_key = state_key
+            state, _, _ = self._update_ui_once()
             if state == "stopped":
                 break
             time.sleep(REFRESH_INTERVAL_SEC)
